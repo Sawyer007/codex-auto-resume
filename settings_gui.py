@@ -90,12 +90,16 @@ DEFAULT_SETTINGS = {
     "post_resume_cooldown": 6.0,
     "poll_interval_seconds": 1.0,
     "max_retries_consecutive": 10,
+    "usage_limit_resume_message": "continue",
+    "usage_limit_resume_margin_seconds": 60.0,
+    "auto_trust_folders": False,
     "error_patterns": [
         {"pattern": "selected model is at capacity", "name": "Model Capacity / Server Overload", "enabled": True, "custom": False},
         {"pattern": "error running remote compact task", "name": "Remote Compact Task Error", "enabled": True, "custom": False},
         {"pattern": "stream disconnected", "name": "Stream Disconnected / Network Loss", "enabled": True, "custom": False},
         {"pattern": "connection lost", "name": "Connection Lost", "enabled": True, "custom": False},
         {"pattern": "rate limit", "name": "Rate Limit Exceeded", "enabled": True, "custom": False},
+        {"pattern": "usage limit", "name": "Usage Limit Reached", "enabled": True, "custom": False},
         {"pattern": "timeout", "name": "Request Timeout", "enabled": True, "custom": False},
         {"pattern": "an unexpected error occurred", "name": "Unexpected Server Error", "enabled": True, "custom": False},
         {"pattern": "serveroverloaded", "name": "Server Overloaded Code", "enabled": True, "custom": False}

@@ -16,6 +16,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import threading
 import subprocess
+import re
+from datetime import datetime, timedelta
 
 def _early_attach_default_desktop():
     try:
@@ -35,6 +37,8 @@ _early_attach_default_desktop()
 
 import win32gui
 import win32con
+import win32process
+import psutil
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QPoint
@@ -97,6 +101,9 @@ def attach_desktop():
 # -------------------------------------------------------------
 # Определение окна Codex / ChatGPT и сопоставление данных
 # -------------------------------------------------------------
+CODEX_PROCESS_NAMES = ("chatgpt.exe", "codex.exe")
+
+
 def find_codex_window():
     """Поиск главного окна Codex / ChatGPT (включая свёрнутое или открытое)"""
     attach_desktop()
@@ -107,6 +114,10 @@ def find_codex_window():
             txt = win32gui.GetWindowText(h)
             cls = win32gui.GetClassName(h)
             if cls == "Chrome_WidgetWin_1" and any(k in txt.lower() for k in ("chatgpt", "codex")):
+                # Только окна процессов Codex / ChatGPT (исключаем браузеры и IDE с «codex» в заголовке)
+                pid = win32process.GetWindowThreadProcessId(h)[1]
+                if psutil.Process(pid).name().lower() not in CODEX_PROCESS_NAMES:
+                    return True
                 if win32gui.IsIconic(h):
                     found_windows.append(h)
                 elif win32gui.IsWindowVisible(h):
@@ -243,6 +254,58 @@ def get_latest_turn_info(thread_id=None):
         logger.debug(f"Ошибка get_latest_turn_info: {e}")
     return None, None, None, None
 
+USAGE_LIMIT_MARKERS = ("usagelimitexceeded", "usage limit")
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+)}
+# «try again at Oct 4th, 2026 12:14 AM.» либо «try again at 8:02 PM.»
+_USAGE_RESET_RE = re.compile(
+    r"try again at\s+(?:([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}),?\s+)?(\d{1,2}):(\d{2})\s*([AP]M)",
+    re.IGNORECASE
+)
+
+def is_usage_limit_error(err_json):
+    """Ошибка исчерпания лимита использования (5-часовое / недельное окно)"""
+    low = (err_json or "").lower()
+    return any(k in low for k in USAGE_LIMIT_MARKERS)
+
+def parse_usage_limit_reset(err_json, completed_at=None):
+    """Время сброса лимита (unix-время, локальное) из текста ошибки, либо None"""
+    m = _USAGE_RESET_RE.search(err_json or "")
+    if not m:
+        return None
+    try:
+        mon, day, year, hh, mm, ampm = m.groups()
+        hour = int(hh) % 12 + (12 if ampm.upper() == "PM" else 0)
+        if mon:
+            month = _MONTHS.get(mon[:3].lower())
+            if not month:
+                return None
+            dt = datetime(int(year), month, int(day), hour, int(mm))
+        else:
+            base = datetime.fromtimestamp(completed_at or time.time())
+            dt = base.replace(hour=hour, minute=int(mm), second=0, microsecond=0)
+            if dt < base:
+                dt += timedelta(days=1)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+USER_IDLE_BEFORE_CHAT_SWITCH = 120.0
+
+def get_user_idle_seconds():
+    """Сколько секунд пользователь не трогал клавиатуру и мышь"""
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+    try:
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        pass
+    return 0.0
+
 def is_thread_in_progress(thread_id):
     """Проверка, выполняется ли сейчас генерация в указанном потоке"""
     try:
@@ -359,6 +422,37 @@ def wake_chromium_accessibility(hwnd):
     except Exception:
         pass
 
+def find_composer(uia, root):
+    """Поле ввода сообщения Codex (ProseMirror)"""
+    from comtypes.gen.UIAutomationClient import TreeScope_Descendants, UIA_ControlTypePropertyId
+    composer = None
+    edits = root.FindAll(TreeScope_Descendants, uia.CreatePropertyCondition(UIA_ControlTypePropertyId, 50004))
+    for i in range(edits.Length):
+        el = edits.GetElement(i)
+        if "prosemirror" in (el.CurrentClassName or "").lower():
+            composer = el
+    return composer
+
+def flush_stale_uia_tree(uia, root, hwnd):
+    """
+    У свёрнутого / скрытого окна (в т.ч. при закрытой крышке ноутбука) Chromium отдаёт дерево UIA
+    с отставанием на одно действие. Безвредный ScrollIntoView на поле ввода заставляет его
+    отдать актуальное состояние, не меняя фокус.
+    """
+    try:
+        if win32gui.GetForegroundWindow() == hwnd:
+            return
+        from comtypes.gen.UIAutomationClient import UIA_ScrollItemPatternId, IUIAutomationScrollItemPattern
+        composer = find_composer(uia, root)
+        if not composer:
+            return
+        pat = composer.GetCurrentPattern(UIA_ScrollItemPatternId)
+        if pat:
+            pat.QueryInterface(IUIAutomationScrollItemPattern).ScrollIntoView()
+            time.sleep(0.4)
+    except Exception as e:
+        logger.debug(f"Ошибка flush_stale_uia_tree: {e}")
+
 def find_uia_action_buttons(hwnd):
     """Поиск кнопок возобновления, повтора и индикатора выполнения в окне Codex"""
     wake_chromium_accessibility(hwnd)
@@ -377,6 +471,8 @@ def find_uia_action_buttons(hwnd):
         root = uia.ElementFromHandle(hwnd)
         if not root:
             return None, None, False
+
+        flush_stale_uia_tree(uia, root, hwnd)
 
         cond_btn = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, 50000)
         elems = root.FindAll(TreeScope_Descendants, cond_btn)
@@ -446,6 +542,124 @@ def invoke_button(btn_tuple):
     except Exception as e:
         logger.debug(f"DoDefaultAction failed for {label}: {e}")
     return False
+
+# Промо-диалог «Introducing Fast mode»: оставляем стандартную скорость (Fast увеличивает расход лимита)
+ALWAYS_DISMISS_DIALOG_BUTTONS = ("Use standard speed",)
+
+def dismiss_blocking_dialog(hwnd, button_names):
+    """
+    Модальные диалоги Codex («Trust these folders?», «Introducing Fast mode») перекрывают всё окно
+    и блокируют возобновление. Нажимает первую найденную кнопку из button_names.
+    Возвращает True, если диалог был закрыт.
+    """
+    try:
+        from comtypes.client import CreateObject, GetModule
+        GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation,
+            IUIAutomation,
+            TreeScope_Descendants,
+            UIA_ControlTypePropertyId
+        )
+        uia = CreateObject(CUIAutomation, interface=IUIAutomation)
+        root = uia.ElementFromHandle(hwnd)
+        if not root:
+            return False
+
+        wanted = {n.lower(): n for n in button_names}
+        target = None
+        btns = root.FindAll(TreeScope_Descendants, uia.CreatePropertyCondition(UIA_ControlTypePropertyId, 50000))
+        for i in range(btns.Length):
+            b = btns.GetElement(i)
+            if (b.CurrentName or "").strip().lower() in wanted:
+                target = b
+                break
+        # Под модальным диалогом остальной интерфейс недоступен; если поле ввода видно - это не диалог
+        if not target or find_composer(uia, root):
+            return False
+
+        details = []
+        for ctype in (50020, 50007):
+            items = root.FindAll(TreeScope_Descendants, uia.CreatePropertyCondition(UIA_ControlTypePropertyId, ctype))
+            for i in range(items.Length):
+                name = (items.GetElement(i).CurrentName or "").strip()
+                if name:
+                    details.append(name[:80])
+
+        label = target.CurrentName
+        if invoke_button((target, label)):
+            logger.info(f"Блокирующий диалог закрыт автоматически кнопкой '{label}': {' | '.join(details[:4]) or '?'}")
+            return True
+    except Exception as e:
+        logger.debug(f"Ошибка dismiss_blocking_dialog: {e}")
+    return False
+
+def get_visible_chat_title(hwnd):
+    """Название чата, открытого сейчас в окне Codex (имя корневого документа)"""
+    try:
+        from comtypes.client import CreateObject, GetModule
+        GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation,
+            IUIAutomation,
+            TreeScope_Descendants,
+            UIA_ControlTypePropertyId
+        )
+        uia = CreateObject(CUIAutomation, interface=IUIAutomation)
+        root = uia.ElementFromHandle(hwnd)
+        if not root:
+            return None
+        doc = root.FindFirst(TreeScope_Descendants, uia.CreatePropertyCondition(UIA_ControlTypePropertyId, 50030))
+        if doc:
+            return (doc.CurrentName or "").strip() or None
+    except Exception as e:
+        logger.debug(f"Ошибка get_visible_chat_title: {e}")
+    return None
+
+def send_chat_message(hwnd, text):
+    """Фоновая отправка сообщения в открытый чат: текст в поле ввода + кнопка Send через UIA"""
+    wake_chromium_accessibility(hwnd)
+    try:
+        from comtypes.client import CreateObject, GetModule
+        GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation,
+            IUIAutomation,
+            TreeScope_Descendants,
+            UIA_ControlTypePropertyId,
+            UIA_ValuePatternId,
+            IUIAutomationValuePattern,
+        )
+        uia = CreateObject(CUIAutomation, interface=IUIAutomation)
+        root = uia.ElementFromHandle(hwnd)
+        if not root:
+            return False
+
+        composer = find_composer(uia, root)
+        if not composer:
+            logger.debug("Поле ввода Codex не найдено.")
+            return False
+
+        val = composer.GetCurrentPattern(UIA_ValuePatternId).QueryInterface(IUIAutomationValuePattern)
+        val.SetValue(text)
+
+        # Кнопка Send становится активной, только когда текст принят и лимит действительно сброшен
+        cond_btn = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, 50000)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            time.sleep(0.5)
+            flush_stale_uia_tree(uia, root, hwnd)
+            btns = root.FindAll(TreeScope_Descendants, cond_btn)
+            for i in range(btns.Length):
+                b = btns.GetElement(i)
+                if (b.CurrentName or "").strip().lower() in ("send", "отправить") and b.CurrentIsEnabled:
+                    return invoke_button((b, b.CurrentName))
+
+        val.SetValue("")
+        return False
+    except Exception as e:
+        logger.debug(f"Ошибка send_chat_message: {e}")
+        return False
 
 def switch_to_sidebar_chat(hwnd, target_chat_name):
     """Фоновое переключение чата в боковом меню через UIAutomation"""
@@ -527,6 +741,9 @@ class WatchdogWorker(QObject):
         self.consecutive_retries = 0
         self.last_codex_running = None
         self._running = True
+        self._usage_wait_key = None
+        self._usage_sent_key = None
+        self._usage_next_try = 0.0
 
     def toggle(self):
         self.is_enabled = not self.is_enabled
@@ -542,6 +759,76 @@ class WatchdogWorker(QObject):
 
     def stop(self):
         self._running = False
+
+    def try_usage_limit_resume(self, hwnd, s, max_retries):
+        """
+        Лимит использования исчерпан: кнопок Resume/Retry нет, поэтому после времени сброса
+        отправляем в открытый чат сообщение-продолжение. Возвращает True, если сообщение отправлено.
+        """
+        tid, turn_status, err_json, completed_at = get_latest_turn_info()
+        if turn_status != "failed" or not is_usage_limit_error(err_json):
+            return False
+        if not settings_mgr.is_error_allowed(err_json):
+            return False
+
+        turn_key = (tid, completed_at)
+        if turn_key == self._usage_sent_key:
+            return False
+
+        thread_cwd = get_thread_project_map().get(str(tid).strip()) if tid else None
+        if thread_cwd and not settings_mgr.is_project_enabled(thread_cwd):
+            return False
+
+        reset_ts = parse_usage_limit_reset(err_json, completed_at)
+        chat_name = get_thread_name_map().get(str(tid).strip()) if tid else None
+        if turn_key != self._usage_wait_key:
+            self._usage_wait_key = turn_key
+            self._usage_next_try = 0.0
+            if reset_ts:
+                logger.info(
+                    f"Лимит использования исчерпан | Чат: «{chat_name or 'Активный чат'}». "
+                    f"Продолжение после сброса: {datetime.fromtimestamp(reset_ts):%d.%m %H:%M}."
+                )
+            else:
+                logger.warning("Лимит использования исчерпан, но время сброса в ошибке не найдено. Авто-продолжение пропущено.")
+        if not reset_ts:
+            return False
+
+        now = time.time()
+        margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
+        if now < reset_ts + margin or now < self._usage_next_try:
+            return False
+        if max_retries > 0 and self.consecutive_retries >= max_retries:
+            return False
+
+        # Сообщение уходит в открытый чат, поэтому он должен совпадать с прерванным
+        visible = get_visible_chat_title(hwnd)
+        if chat_name and visible and chat_name.strip().lower() != visible.strip().lower():
+            # Пользователь не за компьютером -> возвращаемся в прерванный чат сами
+            if get_user_idle_seconds() >= USER_IDLE_BEFORE_CHAT_SWITCH and switch_to_sidebar_chat(hwnd, chat_name):
+                logger.info(f"Лимит сброшен, открыт другой чат («{visible}»). Переключение на «{chat_name}».")
+                self._usage_next_try = now + 5.0
+                return False
+            logger.info(f"Лимит сброшен, но открыт другой чат («{visible}» вместо «{chat_name}»). Продолжение отложено.")
+            self._usage_next_try = now + 60.0
+            return False
+
+        message = str(s.get("usage_limit_resume_message", "continue")).strip() or "continue"
+        if not send_chat_message(hwnd, message):
+            logger.warning("Лимит сброшен, но отправить сообщение не удалось (кнопка Send неактивна). Повтор через 60 сек.")
+            self._usage_next_try = now + 60.0
+            return False
+
+        self._usage_sent_key = turn_key
+        self.resumes_count += 1
+        self.consecutive_retries += 1
+        self.stats_updated.emit(self.resumes_count)
+        self.resume_triggered.emit("ОТВЕТ")
+        logger.info(
+            f">>> ВОЗОБНОВЛЕНИЕ (ЛИМИТ) | Чат: «{chat_name or visible or 'Активный чат'}» | "
+            f"Отправлено сообщение: «{message}»! Всего: {self.resumes_count} <<<"
+        )
+        return True
 
     def run_loop(self):
         attach_desktop()
@@ -593,7 +880,7 @@ class WatchdogWorker(QObject):
                     thread_cwd = proj_map.get(str(tid).strip()) if tid else None
 
                     # 1. Проверка фильтра проектов
-                    if thread_cwd and hasattr(settings_mgr, 'is_project_allowed') and not settings_mgr.is_project_allowed(thread_cwd):
+                    if thread_cwd and not settings_mgr.is_project_enabled(thread_cwd):
                         logger.info(f"Проект '{thread_cwd}' исключён в настройках. Авто-возобновление пропущено.")
                         time.sleep(poll_interval * 2)
                         continue
@@ -609,6 +896,14 @@ class WatchdogWorker(QObject):
                             logger.info(f"Ошибка '{err_json[:60]}' отключена в настройках или не отслеживается. Авто-возобновление пропущено.")
                             time.sleep(poll_interval * 2)
                             continue
+
+                        # До сброса лимита использования нажимать кнопку бессмысленно
+                        if is_usage_limit_error(err_json):
+                            reset_ts = parse_usage_limit_reset(err_json, completed_at)
+                            margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
+                            if reset_ts and time.time() < reset_ts + margin:
+                                time.sleep(poll_interval * 2)
+                                continue
 
                     # 3. Лимит повторов подряд
                     if max_retries > 0 and self.consecutive_retries >= max_retries:
@@ -676,6 +971,16 @@ class WatchdogWorker(QObject):
                             time.sleep(cooldown_cfg)
                             continue
 
+                elif not is_running:
+                    dialog_buttons = list(ALWAYS_DISMISS_DIALOG_BUTTONS)
+                    if s.get("auto_trust_folders", False):
+                        dialog_buttons.append("Trust folders")
+                    if dismiss_blocking_dialog(hwnd, dialog_buttons):
+                        time.sleep(poll_interval * 2)
+                        continue
+                    if self.try_usage_limit_resume(hwnd, s, max_retries):
+                        time.sleep(cooldown_cfg)
+                        continue
 
                 time.sleep(poll_interval)
             except Exception as e:
