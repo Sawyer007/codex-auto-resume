@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import re
+import glob
 import ctypes
 from ctypes import wintypes
 import logging
@@ -93,6 +94,9 @@ DEFAULT_SETTINGS = {
     "usage_limit_resume_message": "continue",
     "usage_limit_resume_margin_seconds": 60.0,
     "auto_trust_folders": False,
+    "watch_visible_chat_only": False,
+    "watch_selected_chats_only": False,
+    "selected_chats": [],
     "error_patterns": [
         {"pattern": "selected model is at capacity", "name": "Model Capacity / Server Overload", "enabled": True, "custom": False},
         {"pattern": "error running remote compact task", "name": "Remote Compact Task Error", "enabled": True, "custom": False},
@@ -130,6 +134,13 @@ TRANSLATIONS = {
         "tip_disabled": "Codex Auto-Resume: ВЫКЛЮЧЕНО ⚪",
         "tip_goals": "Цели ({count}): {names}",
         "tip_resumes": "Возобновлений: {count}",
+        "tip_no_codex": "Codex не найден - ожидание ⚠",
+        "tip_st_watching": "слежу",
+        "tip_st_generating": "генерация",
+        "tip_st_button": "кнопка, возобновляю",
+        "tip_st_limit": "ждёт сброса лимита",
+        "tip_st_error": "ошибка",
+        "tip_st_hidden": "окно скрыто ⚠",
 
         # Всплывающие уведомления Windows
         "notif_app_title": "Codex Auto-Resume",
@@ -168,6 +179,19 @@ TRANSLATIONS = {
         "desc_autostart_windows": "Автоматически запускать сторож в системном трее при входе в систему",
         "chk_enable_on_codex_start": "Включать при старте Codex",
         "desc_enable_on_codex_start": "Автоматически переводить сторож в активный режим при запуске приложения Codex",
+        "nav_chats": "Чаты",
+        "tab_chats": "Наблюдаемые чаты",
+        "lbl_chats_desc": "Недавние чаты всех аккаунтов Codex. Отметьте, какие чаты возобновлять: остальные сторож не трогает (например, чаты по расписанию).",
+        "chk_watch_selected_chats": "Возобновлять только выбранные чаты",
+        "desc_watch_selected_chats": "Сторож действует, только если открыт один из отмеченных ниже чатов. Решение принимается по ходу этого чата",
+        "search_chats_placeholder": "Поиск чатов по названию или проекту...",
+        "chats_count_label": "Выбрано {selected} из {total} чатов",
+        "no_chats_found": "Чаты Codex пока не найдены",
+        "btn_refresh_chats": "Обновить список",
+        "grp_chats": "Недавние чаты",
+        "tip_st_skipped": "чат не выбран",
+        "chk_watch_visible_chat": "Следить только за открытым чатом",
+        "desc_watch_visible_chat": "Решение о возобновлении берётся по ходу открытого чата, а не по самому свежему ходу аккаунта. Полезно, если параллельно работают чаты по расписанию или авто-ревью",
 
         "grp_notifications": "Оповещения",
         "chk_notify_toggle": "Уведомление при переключении (Вкл / Выкл)",
@@ -266,6 +290,13 @@ TRANSLATIONS = {
         "tip_disabled": "Codex Auto-Resume: DISABLED ⚪",
         "tip_goals": "Goals ({count}): {names}",
         "tip_resumes": "Resumes: {count}",
+        "tip_no_codex": "Codex not detected - waiting ⚠",
+        "tip_st_watching": "watching",
+        "tip_st_generating": "generating",
+        "tip_st_button": "button, resuming",
+        "tip_st_limit": "waiting for limit reset",
+        "tip_st_error": "error",
+        "tip_st_hidden": "window hidden ⚠",
 
         # Windows notifications
         "notif_app_title": "Codex Auto-Resume",
@@ -304,6 +335,19 @@ TRANSLATIONS = {
         "desc_autostart_windows": "Automatically launch the guardian in the system tray on Windows login",
         "chk_enable_on_codex_start": "Enable on Codex Start",
         "desc_enable_on_codex_start": "Automatically set guardian to active state when Codex application opens",
+        "nav_chats": "Chats",
+        "tab_chats": "Monitored Chats",
+        "lbl_chats_desc": "Recent chats of all Codex accounts. Check the chats to resume; the others are left alone (e.g. scheduled chats).",
+        "chk_watch_selected_chats": "Resume only selected chats",
+        "desc_watch_selected_chats": "The guardian acts only when one of the chats checked below is open. The decision uses that chat's own turn",
+        "search_chats_placeholder": "Search chats by title or project...",
+        "chats_count_label": "Selected {selected} of {total} chats",
+        "no_chats_found": "No Codex chats found yet",
+        "btn_refresh_chats": "Refresh list",
+        "grp_chats": "Recent Chats",
+        "tip_st_skipped": "chat not selected",
+        "chk_watch_visible_chat": "Watch only the open chat",
+        "desc_watch_visible_chat": "Base the resume decision on the open chat's latest turn instead of the account's newest turn. Useful when scheduled chats or auto-review run in parallel",
 
         "grp_notifications": "Notifications",
         "chk_notify_toggle": "Notification on Toggle (On / Off)",
@@ -469,12 +513,39 @@ class SettingsManager:
 
 settings_mgr = SettingsManager()
 
+_REGISTERED_CODEX_HOMES = set()
+
+def register_codex_home(home):
+    """Запомнить каталог данных запущенного аккаунта Codex (CODEX_HOME), чтобы собирать проекты и с него"""
+    if home:
+        _REGISTERED_CODEX_HOMES.add(os.path.normpath(home))
+
+def known_codex_homes():
+    """Каталоги данных всех аккаунтов Codex: по умолчанию, запущенные сейчас и ~/.codex* с индексом сессий"""
+    candidates = [CODEX_DIR] + sorted(_REGISTERED_CODEX_HOMES)
+    try:
+        for p in glob.glob(os.path.join(USER_PROFILE, ".codex*")):
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "session_index.jsonl")):
+                candidates.append(p)
+    except Exception:
+        pass
+    homes, seen = [], set()
+    for p in candidates:
+        key = os.path.normcase(os.path.normpath(p))
+        if key not in seen:
+            seen.add(key)
+            homes.append(p)
+    return homes
+
 def get_all_codex_projects():
-    """Сбор всех уникальных проектов из session_index.jsonl"""
+    """Сбор всех уникальных проектов из session_index.jsonl всех аккаунтов Codex"""
     projects = {}
-    if os.path.exists(SESSION_INDEX_FILE):
+    for home in known_codex_homes():
+        index_file = os.path.join(home, "session_index.jsonl")
+        if not os.path.exists(index_file):
+            continue
         try:
-            with open(SESSION_INDEX_FILE, "r", encoding="utf-8") as f:
+            with open(index_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -492,6 +563,61 @@ def get_all_codex_projects():
         except Exception:
             pass
     return projects
+
+def read_chat_catalog(home, limit=None):
+    """
+    Чаты аккаунта (CODEX_HOME), от свежих к старым: [{"id", "title", "cwd", "updated_ms", "home"}].
+    Архивные чаты и служебные (guardian review и др. подагенты) не включаются.
+    """
+    import sqlite3
+    chats = []
+    db = os.path.join(home, "state_5.sqlite")
+    try:
+        if os.path.exists(db):
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+            rows = conn.execute(
+                "SELECT id, coalesce(nullif(name, ''), title), cwd, updated_at_ms, archived, thread_source "
+                "FROM threads ORDER BY updated_at_ms DESC"
+            ).fetchall()
+            conn.close()
+            for tid, title, cwd, upd, archived, source in rows:
+                if archived or (source not in (None, "", "user")):
+                    continue
+                title = (title or "").strip()
+                if tid and title:
+                    chats.append({"id": str(tid), "title": title,
+                                  "cwd": (cwd or "").replace("\\\\?\\", ""),
+                                  "updated_ms": upd or 0, "home": home})
+    except Exception:
+        chats = []
+
+    if not chats:  # запасной вариант: журнал сессий без времени и проекта
+        index_file = os.path.join(home, "session_index.jsonl")
+        seen = {}
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        tid = obj.get("id") or obj.get("thread_id")
+                        title = obj.get("thread_name") or obj.get("title") or obj.get("name")
+                        if tid and title:
+                            seen[str(tid)] = {"id": str(tid), "title": title.strip(), "cwd": obj.get("cwd") or "",
+                                              "updated_ms": 0, "home": home}
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        chats = list(reversed(list(seen.values())))
+    return chats[:limit] if limit else chats
+
+def get_recent_chats(limit=40):
+    """Недавние чаты всех известных аккаунтов Codex, от свежих к старым"""
+    chats = []
+    for home in known_codex_homes():
+        chats.extend(read_chat_catalog(home))
+    chats.sort(key=lambda c: c.get("updated_ms", 0), reverse=True)
+    return chats[:limit]
 
 def attach_desktop():
     """Безопасно переключает поток на рабочий стол Default (интерактивный рабочий стол Windows)."""
@@ -780,6 +906,7 @@ class SettingsWindow(QMainWindow):
         self.interface_general = self.create_general_interface()
         self.interface_errors = self.create_errors_interface()
         self.interface_projects = self.create_projects_interface()
+        self.interface_chats = self.create_chats_interface()
         self.interface_timers = self.create_timers_interface()
         self.interface_journal = self.create_journal_interface()
 
@@ -788,6 +915,7 @@ class SettingsWindow(QMainWindow):
         self.addSubInterface(self.interface_general, FIF.SETTING, tr("nav_general"))
         self.addSubInterface(self.interface_errors, FIF.INFO, tr("nav_errors"))
         self.addSubInterface(self.interface_projects, FIF.FOLDER, tr("nav_projects"))
+        self.addSubInterface(self.interface_chats, FIF.CHAT, tr("nav_chats"))
         self.addSubInterface(self.interface_timers, FIF.SPEED_HIGH, tr("nav_timers"))
         self.addSubInterface(self.interface_journal, FIF.DOCUMENT, tr("nav_journal"))
         self.nav.setCurrentItem(self.interface_general.objectName())
@@ -797,6 +925,7 @@ class SettingsWindow(QMainWindow):
         # Привязка переключателей к авто-сохранению единожды
         self.card_autostart.checkedChanged.connect(self._sync_autostart)
         self.card_codex_start.checkedChanged.connect(lambda c: self._quick_save("enable_on_codex_start", c))
+        self.card_watch_visible.checkedChanged.connect(lambda c: self._quick_save("watch_visible_chat_only", c))
         self.card_notif_toggle.checkedChanged.connect(lambda c: self._quick_save("notify_on_toggle", c))
         self.card_notif_resume.checkedChanged.connect(lambda c: self._quick_save("notify_on_resume", c))
         self.card_sound_resume.checkedChanged.connect(lambda c: self._quick_save("sound_on_resume", c))
@@ -848,8 +977,15 @@ class SettingsWindow(QMainWindow):
             self.mgr.tr("desc_enable_on_codex_start"),
             parent=self.grp_startup
         )
+        self.card_watch_visible = CustomSwitchSettingCard(
+            FIF.VIEW,
+            self.mgr.tr("chk_watch_visible_chat"),
+            self.mgr.tr("desc_watch_visible_chat"),
+            parent=self.grp_startup
+        )
         self.grp_startup.addSettingCard(self.card_autostart)
         self.grp_startup.addSettingCard(self.card_codex_start)
+        self.grp_startup.addSettingCard(self.card_watch_visible)
         vbox.addWidget(self.grp_startup)
 
         # Группа 3: Оповещения
@@ -1164,6 +1300,153 @@ class SettingsWindow(QMainWindow):
             card.setVisible(match)
 
     # ---------------------------------------------------------
+    # Вкладка: Чаты (выбор наблюдаемых чатов)
+    # ---------------------------------------------------------
+    def create_chats_interface(self):
+        scroll = ScrollArea()
+        scroll.setObjectName("chatsInterface")
+        scroll.setWidgetResizable(True)
+
+        container = QWidget()
+        container.setStyleSheet("background-color: transparent;")
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(36, 24, 36, 24)
+        vbox.setSpacing(18)
+
+        self.lbl_title_chats = SubtitleLabel(self.mgr.tr("tab_chats"), container)
+        vbox.addWidget(self.lbl_title_chats)
+
+        self.lbl_desc_chats = CaptionLabel(self.mgr.tr("lbl_chats_desc"), container)
+        self.lbl_desc_chats.setTextColor(QColor("#a6adc8"), QColor("#a6adc8"))
+        vbox.addWidget(self.lbl_desc_chats)
+
+        # Главный переключатель режима «только выбранные чаты»
+        self.card_watch_selected = CustomSwitchSettingCard(
+            FIF.CHAT,
+            self.mgr.tr("chk_watch_selected_chats"),
+            self.mgr.tr("desc_watch_selected_chats"),
+            parent=container
+        )
+        self.card_watch_selected.checkedChanged.connect(lambda c: self._quick_save("watch_selected_chats_only", c))
+        vbox.addWidget(self.card_watch_selected)
+
+        action_card = CardWidget(container)
+        action_layout = QHBoxLayout(action_card)
+        action_layout.setContentsMargins(18, 14, 18, 14)
+        action_layout.setSpacing(12)
+
+        self.search_chats = SearchLineEdit(action_card)
+        self.search_chats.setPlaceholderText(self.mgr.tr("search_chats_placeholder"))
+        self.search_chats.textChanged.connect(self.filter_chat_cards)
+        action_layout.addWidget(self.search_chats, 1)
+
+        self.btn_select_all_chats = PushButton(FIF.CHECKBOX, self.mgr.tr("btn_select_all"), action_card)
+        self.btn_select_all_chats.clicked.connect(lambda: self._set_all_chats(True))
+        action_layout.addWidget(self.btn_select_all_chats)
+
+        self.btn_deselect_all_chats = PushButton(FIF.CLOSE, self.mgr.tr("btn_deselect_all"), action_card)
+        self.btn_deselect_all_chats.clicked.connect(lambda: self._set_all_chats(False))
+        action_layout.addWidget(self.btn_deselect_all_chats)
+
+        self.btn_refresh_chats = PushButton(FIF.SYNC, self.mgr.tr("btn_refresh_chats"), action_card)
+        self.btn_refresh_chats.clicked.connect(self.refresh_chat_cards)
+        action_layout.addWidget(self.btn_refresh_chats)
+        vbox.addWidget(action_card)
+
+        self.lbl_chats_count = CaptionLabel("", container)
+        self.lbl_chats_count.setTextColor(QColor("#70d6ff"), QColor("#70d6ff"))
+        vbox.addWidget(self.lbl_chats_count)
+
+        self.grp_chats = SettingCardGroup(self.mgr.tr("grp_chats"), container)
+        vbox.addWidget(self.grp_chats)
+        self.chat_item_widgets = []
+
+        vbox.addStretch(1)
+        scroll.setWidget(container)
+        return scroll
+
+    @staticmethod
+    def _account_name(home):
+        """default / account2 - по каталогу данных аккаунта"""
+        if os.path.normcase(os.path.normpath(home)) == os.path.normcase(os.path.normpath(CODEX_DIR)):
+            return "default"
+        name = os.path.basename(os.path.normpath(home)).lstrip(".")
+        return name[len("codex-"):] if name.startswith("codex-") and len(name) > 6 else name
+
+    def refresh_chat_cards(self):
+        while self.grp_chats.cardLayout.count():
+            item = self.grp_chats.cardLayout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.chat_item_widgets.clear()
+
+        chats = get_recent_chats(40)
+        selected = set(str(x) for x in self.mgr.settings.get("selected_chats", []))
+        # Выбранные чаты, которых нет среди недавних, остаются в списке, чтобы выбор не терялся молча
+        known = {c["id"] for c in chats}
+        for tid in sorted(selected - known):
+            chats.append({"id": tid, "title": tid[:8], "cwd": "", "updated_ms": 0, "home": CODEX_DIR})
+
+        if not chats:
+            empty_card = SettingCard(FIF.INFO, self.mgr.tr("no_chats_found"), "", parent=self.grp_chats)
+            self.grp_chats.addSettingCard(empty_card)
+            self.lbl_chats_count.setText("")
+            return
+
+        import datetime
+        for c in chats:
+            parts = [self._account_name(c["home"])]
+            if c.get("cwd"):
+                parts.append(os.path.basename(os.path.normpath(c["cwd"])) or c["cwd"])
+            if c.get("updated_ms"):
+                parts.append(datetime.datetime.fromtimestamp(c["updated_ms"] / 1000).strftime("%d.%m %H:%M"))
+            card = SettingCard(FIF.CHAT, c["title"], "  ·  ".join(parts), parent=self.grp_chats)
+
+            sw = SwitchButton(card)
+            sw.setOnText(self.mgr.tr("switch_on"))
+            sw.setOffText(self.mgr.tr("switch_off"))
+            sw.setChecked(c["id"] in selected)
+            sw.checkedChanged.connect(lambda checked, t=c["id"]: self._on_chat_toggled(t, checked))
+            card.hBoxLayout.addWidget(sw)
+            card.hBoxLayout.addSpacing(16)
+
+            self.grp_chats.addSettingCard(card)
+            self.chat_item_widgets.append((card, c["id"], c["title"], " ".join(parts), sw))
+        self.update_chats_count_label()
+
+    def update_chats_count_label(self):
+        total = len(self.chat_item_widgets)
+        selected = sum(1 for item in self.chat_item_widgets if item[4].isChecked())
+        self.lbl_chats_count.setText(self.mgr.tr("chats_count_label", selected=selected, total=total))
+
+    def _on_chat_toggled(self, tid, checked):
+        chosen = [str(x) for x in self.mgr.settings.get("selected_chats", [])]
+        if checked and tid not in chosen:
+            chosen.append(tid)
+        elif not checked:
+            chosen = [x for x in chosen if x != tid]
+        self.mgr.settings["selected_chats"] = chosen
+        self.mgr.save()
+        self.update_chats_count_label()
+        self.settings_saved.emit()
+
+    def _set_all_chats(self, state):
+        for item in self.chat_item_widgets:
+            sw = item[4]
+            sw.blockSignals(True)
+            sw.setChecked(state)
+            sw.blockSignals(False)
+        self.mgr.settings["selected_chats"] = [item[1] for item in self.chat_item_widgets] if state else []
+        self.mgr.save()
+        self.update_chats_count_label()
+        self.settings_saved.emit()
+
+    def filter_chat_cards(self, query):
+        q = query.strip().lower()
+        for card, tid, title, meta, _ in self.chat_item_widgets:
+            card.setVisible((not q) or q in title.lower() or q in meta.lower())
+
+    # ---------------------------------------------------------
     # Вкладка 4: Тайминги и Лимиты
     # ---------------------------------------------------------
     def create_timers_interface(self):
@@ -1427,6 +1710,11 @@ class SettingsWindow(QMainWindow):
                 else:
                     event_title = base_title
 
+                # Несколько аккаунтов Codex: показываем, на каком произошло возобновление
+                m_acc = re.search(r"(?:Аккаунт|Account):\s*([^\s|<!]+)", msg, re.IGNORECASE)
+                if m_acc:
+                    event_title = f"{event_title} [{m_acc.group(1)}]"
+
                 parts_desc = []
                 if goal_text:
                     prefix = tr("journal_prefix_task") if is_task_mode else tr("journal_prefix_goal")
@@ -1538,6 +1826,7 @@ class SettingsWindow(QMainWindow):
         cards = [
             (self.card_autostart, bool(s.get("autostart_windows", True))),
             (self.card_codex_start, bool(s.get("enable_on_codex_start", True))),
+            (self.card_watch_visible, bool(s.get("watch_visible_chat_only", False))),
             (self.card_notif_toggle, bool(s.get("notify_on_toggle", True))),
             (self.card_notif_resume, bool(s.get("notify_on_resume", False))),
             (self.card_sound_resume, bool(s.get("sound_on_resume", False))),
@@ -1556,6 +1845,13 @@ class SettingsWindow(QMainWindow):
 
         self.refresh_error_cards()
         self.refresh_project_cards()
+
+        self.card_watch_selected.switchButton.blockSignals(True)
+        self.card_watch_selected.setChecked(bool(s.get("watch_selected_chats_only", False)))
+        self.card_watch_selected.update_switch_texts()
+        self.card_watch_selected.switchButton.blockSignals(False)
+        self.refresh_chat_cards()
+
         self.refresh_journal_events()
 
     def _quick_save(self, key, val):
@@ -1596,6 +1892,7 @@ class SettingsWindow(QMainWindow):
         self.lbl_title_gen.setText(tr("tab_general"))
         self.lbl_title_err.setText(tr("tab_errors"))
         self.lbl_title_proj.setText(tr("tab_projects"))
+        self.lbl_title_chats.setText(tr("tab_chats"))
         self.lbl_title_time.setText(tr("tab_timers"))
         self.lbl_title_journal.setText(tr("tab_journal"))
 
@@ -1611,6 +1908,10 @@ class SettingsWindow(QMainWindow):
         self.card_codex_start.setTitle(tr("chk_enable_on_codex_start"))
         self.card_codex_start.setContent(tr("desc_enable_on_codex_start"))
         self.card_codex_start.update_switch_texts()
+
+        self.card_watch_visible.setTitle(tr("chk_watch_visible_chat"))
+        self.card_watch_visible.setContent(tr("desc_watch_visible_chat"))
+        self.card_watch_visible.update_switch_texts()
 
         # Оповещения
         self.card_notif_toggle.setTitle(tr("chk_notify_toggle"))
@@ -1639,6 +1940,17 @@ class SettingsWindow(QMainWindow):
         self.btn_deselect_all_proj.setText(tr("btn_deselect_all"))
         self.update_projects_count_label()
 
+        # Чаты
+        self.lbl_desc_chats.setText(tr("lbl_chats_desc"))
+        self.card_watch_selected.setTitle(tr("chk_watch_selected_chats"))
+        self.card_watch_selected.setContent(tr("desc_watch_selected_chats"))
+        self.card_watch_selected.update_switch_texts()
+        self.search_chats.setPlaceholderText(tr("search_chats_placeholder"))
+        self.btn_select_all_chats.setText(tr("btn_select_all"))
+        self.btn_deselect_all_chats.setText(tr("btn_deselect_all"))
+        self.btn_refresh_chats.setText(tr("btn_refresh_chats"))
+        self.update_chats_count_label()
+
         # Тайминги
         self.card_retry.update_texts(tr("lbl_retry_pause"), tr("desc_retry_pause"), tr("unit_seconds"))
         self.card_cooldown.update_texts(tr("lbl_cooldown"), tr("desc_cooldown"), tr("unit_seconds"))
@@ -1660,6 +1972,7 @@ class SettingsWindow(QMainWindow):
             "generalInterface": tr("nav_general"),
             "errorsInterface": tr("nav_errors"),
             "projectsInterface": tr("nav_projects"),
+            "chatsInterface": tr("nav_chats"),
             "timersInterface": tr("nav_timers"),
             "journalInterface": tr("nav_journal"),
         }

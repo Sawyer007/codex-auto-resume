@@ -31,6 +31,8 @@ An intelligent, non-intrusive background guardian for **OpenAI Codex / ChatGPT D
 
 - **🎮 Zero-Interruption Background Execution:**
   Directly interacts with the Codex UI Automation layer (`IUIAutomationInvokePattern` / `IUIAutomationLegacyIAccessiblePattern`). Automatically resumes tasks without bringing windows to foreground or minimizing borderless fullscreen games.
+- **👥 Multiple Codex Accounts:**
+  Every running Codex window is watched separately with its own `CODEX_HOME` (e.g. `~/.codex` and `~/.codex-account2`), so error detection and resume decisions use the right account's history. The tray tooltip shows what is watched per account (`watching` / `generating` / `button` / `window hidden ⚠`); an amber `!` icon means nothing is watched or an account window is hidden in the tray.
 - **✨ Official Codex Branding with Live Status Badges:**
   High-resolution official Codex glyph on a dark squircle with crisp cutout indicator badges:
   - 🟢 **Active / Enabled:** Emerald green circle with checkmark (`✓`).
@@ -141,6 +143,8 @@ Output artifacts:
 
 - **🎮 Бесшумное возобновление без потери фокуса:**
   Прямое взаимодействие с интерфейсом Codex через UI Automation (`IUIAutomationInvokePattern` / `IUIAutomationLegacyIAccessiblePattern`). Автоматически возобновляет выполнение без сворачивания полноэкранных игр в borderless-режиме и без перехвата клавиатурного фокуса.
+- **👥 Несколько аккаунтов Codex:**
+  Каждое запущенное окно Codex наблюдается отдельно со своим `CODEX_HOME` (например, `~/.codex` и `~/.codex-account2`), поэтому ошибки и решения о возобновлении берутся из истории нужного аккаунта. Подсказка в трее показывает состояние по аккаунтам (`слежу` / `генерация` / `кнопка` / `окно скрыто ⚠`); жёлтый значок `!` означает, что ничего не наблюдается либо окно аккаунта скрыто в трей.
 - **✨ Официальный логотип Codex с индикаторами статуса:**
   Четкий официальный векторный логотип Codex на темной подложке со скругленными углами и контрастным вырезом для бейджа:
   - 🟢 **Активен / ВКЛЮЧЕНО:** Изумрудно-зеленый круг с белой галочкой (`✓`).

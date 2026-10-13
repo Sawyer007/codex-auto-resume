@@ -18,6 +18,7 @@ import threading
 import subprocess
 import re
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 def _early_attach_default_desktop():
     try:
@@ -45,7 +46,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QPoint
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QBrush, QPen, QPolygon
 
 # Импорт менеджера настроек и окна настроек
-from settings_gui import settings_mgr, SettingsWindow, get_all_codex_projects
+from settings_gui import settings_mgr, SettingsWindow, get_all_codex_projects, register_codex_home, read_chat_catalog
 
 # -------------------------------------------------------------
 # Конфигурация путей
@@ -57,10 +58,17 @@ os.makedirs(CODEX_DIR, exist_ok=True)
 
 SETTINGS_FILE = os.path.join(CODEX_DIR, "guardian_settings.json")
 LOG_FILE = os.path.join(CODEX_DIR, "guardian.log")
-HISTORY_DB = os.path.join(CODEX_DIR, "thread_history_1.sqlite")
-GOALS_DB = os.path.join(CODEX_DIR, "goals_1.sqlite")
-SESSION_INDEX_FILE = os.path.join(CODEX_DIR, "session_index.jsonl")
 TOGGLE_TRIGGER = os.path.join(CODEX_DIR, "toggle.trigger")
+
+
+def history_db(home=None):
+    return os.path.join(home or CODEX_DIR, "thread_history_1.sqlite")
+
+def goals_db(home=None):
+    return os.path.join(home or CODEX_DIR, "goals_1.sqlite")
+
+def session_index_file(home=None):
+    return os.path.join(home or CODEX_DIR, "session_index.jsonl")
 AUTOSTART_VBS = os.path.join(
     os.environ.get("APPDATA", ""),
     r"Microsoft\Windows\Start Menu\Programs\Startup\CodexAutoResumeWatchdog.vbs"
@@ -104,10 +112,66 @@ def attach_desktop():
 CODEX_PROCESS_NAMES = ("chatgpt.exe", "codex.exe")
 
 
-def find_codex_window():
-    """Поиск главного окна Codex / ChatGPT (включая свёрнутое или открытое)"""
+class CodexInstance(NamedTuple):
+    """Один запущенный Codex (аккаунт): главное окно, PID процесса и его каталог данных CODEX_HOME"""
+    hwnd: int
+    pid: int
+    home: str
+
+
+def same_home(a, b):
+    return os.path.normcase(os.path.normpath(a or CODEX_DIR)) == os.path.normcase(os.path.normpath(b or CODEX_DIR))
+
+def account_label(home):
+    """Короткое имя аккаунта по каталогу данных (.codex-account2 -> codex-account2)"""
+    return os.path.basename(os.path.normpath(home or CODEX_DIR)).lstrip(".") or "codex"
+
+_home_cache = {}  # pid -> (время создания процесса, CODEX_HOME)
+
+def resolve_codex_home(pid):
+    """
+    CODEX_HOME процесса Codex. Несколько аккаунтов = несколько копий приложения с разным CODEX_HOME
+    (у каждой свои базы thread_history / goals / session_index). Без переменной действует ~/.codex.
+    """
+    try:
+        proc = psutil.Process(pid)
+        created = proc.create_time()
+    except Exception:
+        return CODEX_DIR
+    cached = _home_cache.get(pid)
+    if cached and cached[0] == created:
+        return cached[1]
+
+    try:
+        candidates = [proc] + proc.children()  # на случай, если переменная задана только app-server'у
+    except Exception:
+        candidates = [proc]
+
+    home = None
+    read_ok = False
+    for p in candidates:
+        try:
+            env_home = p.environ().get("CODEX_HOME")
+            read_ok = True
+        except Exception:
+            continue
+        if env_home:
+            home = os.path.abspath(os.path.expandvars(os.path.expanduser(env_home)))
+            break
+    if not home or not os.path.isdir(home):
+        home = CODEX_DIR
+    if read_ok:  # не кэшируем результат, если окружение прочитать не удалось
+        _home_cache[pid] = (created, home)
+    return home
+
+def _enum_codex_windows():
+    """
+    Окна Codex / ChatGPT: ([(hwnd, pid), ...] видимые либо свёрнутые, [(hwnd, pid), ...] скрытые).
+    Скрытое окно (свёрнуто в трей) UIA не отдаёт, поэтому такой аккаунт не наблюдается.
+    """
     attach_desktop()
     found_windows = []
+    hidden_windows = []
 
     def enum_cb(h, _):
         try:
@@ -119,13 +183,14 @@ def find_codex_window():
                 if psutil.Process(pid).name().lower() not in CODEX_PROCESS_NAMES:
                     return True
                 if win32gui.IsIconic(h):
-                    found_windows.append(h)
-                elif win32gui.IsWindowVisible(h):
+                    found_windows.append((h, pid))
+                else:
                     rect = win32gui.GetWindowRect(h)
-                    w = rect[2] - rect[0]
-                    h_size = rect[3] - rect[1]
-                    if w > 300 and h_size > 300:
-                        found_windows.append(h)
+                    big = (rect[2] - rect[0]) > 300 and (rect[3] - rect[1]) > 300
+                    if big and win32gui.IsWindowVisible(h):
+                        found_windows.append((h, pid))
+                    elif big:
+                        hidden_windows.append((h, pid))
         except Exception:
             pass
         return True
@@ -134,17 +199,58 @@ def find_codex_window():
         win32gui.EnumWindows(enum_cb, None)
     except Exception:
         pass
-    if found_windows:
-        return found_windows[0]
-    return None
+    return found_windows, hidden_windows
 
-def get_thread_name_map():
+def scan_codex():
+    """
+    Все запущенные экземпляры Codex (по одному окну на процесс) с их CODEX_HOME:
+    (наблюдаемые экземпляры, экземпляры только со скрытым окном)
+    """
+    visible, hidden = _enum_codex_windows()
+    instances, seen = [], set()
+    for hwnd, pid in visible:
+        if pid not in seen:
+            seen.add(pid)
+            instances.append(CodexInstance(hwnd, pid, resolve_codex_home(pid)))
+    hidden_instances = []
+    for hwnd, pid in hidden:
+        if pid not in seen:
+            seen.add(pid)
+            hidden_instances.append(CodexInstance(hwnd, pid, resolve_codex_home(pid)))
+    return instances, hidden_instances
+
+def find_codex_instances():
+    """Наблюдаемые экземпляры Codex (с видимым или свёрнутым окном)"""
+    return scan_codex()[0]
+
+def short_account_name(home):
+    """Имя аккаунта для подсказки в трее: default / account2"""
+    if same_home(home, CODEX_DIR):
+        return "default"
+    name = account_label(home)
+    for prefix in ("codex-", "codex_"):
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return name[len(prefix):]
+    return name
+
+def find_codex_window(home=None):
+    """Главное окно Codex / ChatGPT; при указании home - окно аккаунта с этим CODEX_HOME"""
+    instances = find_codex_instances()
+    if home:
+        for inst in instances:
+            if same_home(inst.home, home):
+                return inst.hwnd
+        return None  # окно нужного аккаунта не найдено - чужой аккаунт не трогаем
+    return instances[0].hwnd if instances else None
+
+def get_thread_name_map(home=None):
     """Сопоставление thread_id -> имя чата из session_index.jsonl"""
     name_map = {}
-    if not os.path.exists(SESSION_INDEX_FILE):
+    index_file = session_index_file(home)
+    if not os.path.exists(index_file):
         return name_map
     try:
-        with open(SESSION_INDEX_FILE, "r", encoding="utf-8") as f:
+        with open(index_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -161,13 +267,14 @@ def get_thread_name_map():
         pass
     return name_map
 
-def get_thread_project_map():
+def get_thread_project_map(home=None):
     """Сопоставление thread_id -> путь к проекту cwd из session_index.jsonl"""
     proj_map = {}
-    if not os.path.exists(SESSION_INDEX_FILE):
+    index_file = session_index_file(home)
+    if not os.path.exists(index_file):
         return proj_map
     try:
-        with open(SESSION_INDEX_FILE, "r", encoding="utf-8") as f:
+        with open(index_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -185,14 +292,17 @@ def get_thread_project_map():
         pass
     return proj_map
 
-def get_all_recent_goals():
-    """Получение недавних целей из goals_1.sqlite для меню и мониторинга"""
+def get_all_recent_goals(home=None):
+    """Недавние цели аккаунта из goals_1.sqlite для меню: (имя чата, статус цели, статус хода, thread_id, обновлено, home)"""
     results = []
-    if not os.path.exists(GOALS_DB):
+    home = home or CODEX_DIR
+    goals_path = goals_db(home)
+    history_path = history_db(home)
+    if not os.path.exists(goals_path):
         return results
     try:
-        name_map = get_thread_name_map()
-        conn = sqlite3.connect(f"file:{GOALS_DB}?mode=ro", uri=True, timeout=1.0)
+        name_map = get_thread_name_map(home)
+        conn = sqlite3.connect(f"file:{goals_path}?mode=ro", uri=True, timeout=1.0)
         cursor = conn.cursor()
         one_day_ago = int((time.time() - 24 * 3600) * 1000)
         cursor.execute(
@@ -203,8 +313,8 @@ def get_all_recent_goals():
         conn.close()
 
         con_h = None
-        if os.path.exists(HISTORY_DB):
-            con_h = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True, timeout=1.0)
+        if os.path.exists(history_path):
+            con_h = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True, timeout=1.0)
 
         for tid, g_st, upd_ms, obj in goals:
             c_name = name_map.get(str(tid).strip(), f"Чат {str(tid)[:8]}")
@@ -218,7 +328,7 @@ def get_all_recent_goals():
                         turn_st = row[0]
                 except Exception:
                     pass
-            results.append((c_name, g_st, turn_st, tid, upd_ms))
+            results.append((c_name, g_st, turn_st, tid, upd_ms, home))
 
         if con_h:
             con_h.close()
@@ -226,14 +336,24 @@ def get_all_recent_goals():
         logger.debug(f"Ошибка get_all_recent_goals: {e}")
     return results
 
-def get_latest_turn_info(thread_id=None):
-    """Получение информации о последнем шаге (turn) из thread_history_1.sqlite"""
-    if not os.path.exists(HISTORY_DB):
+def get_latest_turn_info(thread_id=None, home=None, thread_ids=None):
+    """
+    Получение информации о последнем шаге (turn) из thread_history_1.sqlite аккаунта.
+    thread_ids - список потоков (чаты с одинаковым названием): берётся самый свежий ход среди них.
+    """
+    history_path = history_db(home)
+    if not os.path.exists(history_path):
         return None, None, None, None
     try:
-        conn = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True, timeout=1.0)
+        conn = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True, timeout=1.0)
         cursor = conn.cursor()
-        if thread_id:
+        if thread_ids:
+            marks = ",".join("?" * len(thread_ids))
+            cursor.execute(
+                f"SELECT thread_id, status, error_json, completed_at FROM thread_turns WHERE thread_id IN ({marks}) ORDER BY rowid DESC LIMIT 1",
+                tuple(thread_ids)
+            )
+        elif thread_id:
             cursor.execute(
                 "SELECT thread_id, status, error_json, completed_at FROM thread_turns WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1",
                 (thread_id,)
@@ -306,12 +426,13 @@ def get_user_idle_seconds():
         pass
     return 0.0
 
-def is_thread_in_progress(thread_id):
+def is_thread_in_progress(thread_id, home=None):
     """Проверка, выполняется ли сейчас генерация в указанном потоке"""
     try:
-        if not os.path.exists(HISTORY_DB):
+        history_path = history_db(home)
+        if not os.path.exists(history_path):
             return False
-        conn = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True, timeout=1.0)
+        conn = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True, timeout=1.0)
         cur = conn.cursor()
         cur.execute("SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1", (thread_id,))
         row = cur.fetchone()
@@ -322,7 +443,7 @@ def is_thread_in_progress(thread_id):
         pass
     return False
 
-def get_goal_info_for_thread(thread_id=None):
+def get_goal_info_for_thread(thread_id=None, home=None):
     """
     Возвращает (chat_name, goal_text, is_explicit_goal) для указанного или последнего активного потока.
     - chat_name: Человекочитаемое название чата из session_index.jsonl (или 'Активный чат')
@@ -334,14 +455,17 @@ def get_goal_info_for_thread(thread_id=None):
     is_explicit_goal = False
     tid_str = str(thread_id).strip() if thread_id else ""
 
-    name_map = get_thread_name_map()
+    goals_path = goals_db(home)
+    history_path = history_db(home)
+
+    name_map = get_thread_name_map(home)
     if tid_str and tid_str in name_map:
         chat_name = name_map[tid_str]
 
     # 1. Проверяем thread_goals в goals_1.sqlite
-    if os.path.exists(GOALS_DB):
+    if os.path.exists(goals_path):
         try:
-            conn = sqlite3.connect(f"file:{GOALS_DB}?mode=ro", uri=True, timeout=1.0)
+            conn = sqlite3.connect(f"file:{goals_path}?mode=ro", uri=True, timeout=1.0)
             cur = conn.cursor()
             if tid_str:
                 cur.execute(
@@ -370,9 +494,9 @@ def get_goal_info_for_thread(thread_id=None):
             logger.debug(f"Ошибка чтения thread_goals: {e}")
 
     # 2. Если цель в thread_goals не найдена, пробуем извлечь последний запрос пользователя из thread_history_1.sqlite
-    if not goal_text and tid_str and os.path.exists(HISTORY_DB):
+    if not goal_text and tid_str and os.path.exists(history_path):
         try:
-            conn = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True, timeout=1.0)
+            conn = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True, timeout=1.0)
             cur = conn.cursor()
             cur.execute(
                 "SELECT item_json FROM thread_items WHERE thread_id = ? AND item_type = 'userMessage' ORDER BY rowid DESC LIMIT 1",
@@ -511,11 +635,17 @@ def find_uia_action_buttons(hwnd):
         logger.debug(f"Ошибка find_uia_action_buttons: {e}")
         return None, None, False
 
+# Сторож никогда не трогает платёжные кнопки и сброс лимитов: reset недельного лимита делает только пользователь
+FORBIDDEN_BUTTON_WORDS = ("reset", "сброс", "upgrade", "credit", "purchase", "buy", "купить", "оплат", "тариф")
+
 def invoke_button(btn_tuple):
     """Вызов действия кнопки через UIA чисто в памяти Chromium (без влияния на активные окна)"""
     if not btn_tuple:
         return False
     btn, label = btn_tuple
+    if any(w in (label or "").lower() for w in FORBIDDEN_BUTTON_WORDS):
+        logger.warning(f"Кнопка '{label}' в списке запрещённых (сброс лимитов / оплата) - нажатие пропущено.")
+        return False
     from comtypes.gen.UIAutomationClient import (
         UIA_InvokePatternId,
         IUIAutomationInvokePattern,
@@ -661,6 +791,65 @@ def send_chat_message(hwnd, text):
         logger.debug(f"Ошибка send_chat_message: {e}")
         return False
 
+def usage_limit_banner_visible(hwnd):
+    """
+    Виден ли баннер исчерпанного лимита у поля ввода («You're out of Codex and Work usage» /
+    «Your rate limit resets on ...» / кнопка «Reset usage»). Только чтение: кнопки сброса не трогаем.
+    Возвращает None, если дерево UIA недоступно (тогда выводов не делаем).
+    """
+    try:
+        from comtypes.client import CreateObject, GetModule
+        GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation,
+            IUIAutomation,
+            TreeScope_Descendants,
+            UIA_ControlTypePropertyId,
+        )
+        uia = CreateObject(CUIAutomation, interface=IUIAutomation)
+        root = uia.ElementFromHandle(hwnd)
+        if not root:
+            return None
+        for ctype in (50020, 50000):  # Text, Button
+            els = root.FindAll(TreeScope_Descendants, uia.CreatePropertyCondition(UIA_ControlTypePropertyId, ctype))
+            for i in range(els.Length):
+                name = (els.GetElement(i).CurrentName or "").strip().lower()
+                if not name:
+                    continue
+                if ctype == 50000 and name == "reset usage":
+                    return True
+                if ctype == 50020 and ("rate limit resets" in name or "out of codex" in name):
+                    return True
+        # Баннера нет. «Лимит снят» утверждаем, только если интерфейс чата виден (есть поле ввода):
+        # при модальном диалоге или неготовом дереве UIA судить нельзя
+        return False if find_composer(uia, root) else None
+    except Exception as e:
+        logger.debug(f"Ошибка usage_limit_banner_visible: {e}")
+        return None
+
+def composer_is_empty(hwnd):
+    """Поле ввода пустое (UIA отдаёт placeholder как значение - это тоже пустое поле). При сомнении - False"""
+    try:
+        from comtypes.client import CreateObject, GetModule
+        GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import (
+            CUIAutomation,
+            IUIAutomation,
+            UIA_ValuePatternId,
+            IUIAutomationValuePattern,
+        )
+        uia = CreateObject(CUIAutomation, interface=IUIAutomation)
+        root = uia.ElementFromHandle(hwnd)
+        composer = find_composer(uia, root) if root else None
+        if not composer:
+            return False
+        val = composer.GetCurrentPattern(UIA_ValuePatternId).QueryInterface(IUIAutomationValuePattern)
+        text = (val.CurrentValue or "").strip()
+        return (not text) or text == (composer.CurrentName or "").strip()
+    except Exception as e:
+        logger.debug(f"Ошибка composer_is_empty: {e}")
+        return False
+
 def switch_to_sidebar_chat(hwnd, target_chat_name):
     """Фоновое переключение чата в боковом меню через UIAutomation"""
     try:
@@ -727,108 +916,336 @@ def switch_to_sidebar_chat(hwnd, target_chat_name):
 # -------------------------------------------------------------
 # Фоновый рабочий поток сторожа
 # -------------------------------------------------------------
+class _InstanceState:
+    """Состояние сторожа для одного экземпляра Codex (аккаунта): у каждого свои повторы, паузы и таймеры"""
+    def __init__(self):
+        self.consecutive_retries = 0
+        self.next_check = 0.0          # не опрашивать экземпляр раньше этого времени (cooldown / пауза)
+        self.resume_deadline = None    # когда можно нажимать кнопку после «паузы перед возобновлением»
+        self.usage_wait_key = None
+        self.usage_sent_key = None
+        self.usage_next_try = 0.0
+        self.status = "watching"       # watching / generating / button / limit - для статуса в трее
+        self.limit_banner_key = None   # ход, для которого уже виден баннер «лимит исчерпан»
+        self.banner_gone = 0           # сколько проходов подряд баннер не виден
+
+
 class WatchdogWorker(QObject):
     goals_updated = pyqtSignal(list)
     resume_triggered = pyqtSignal(str)
     stats_updated = pyqtSignal(int)
     state_changed = pyqtSignal(bool)
+    monitor_updated = pyqtSignal(object)   # снимок наблюдения: что именно сторож видит прямо сейчас
 
     def __init__(self):
         super().__init__()
         self.is_enabled = True
         self.resumes_count = 0
         self.force_resume_flag = False
-        self.consecutive_retries = 0
-        self.last_codex_running = None
+        self.last_pids = None          # PID экземпляров Codex на прошлом проходе (None - ещё не опрашивали)
+        self._states = {}              # pid -> _InstanceState
         self._running = True
-        self._usage_wait_key = None
-        self._usage_sent_key = None
-        self._usage_next_try = 0.0
+
+    def _reset_retries(self):
+        for st in list(self._states.values()):
+            st.consecutive_retries = 0
 
     def toggle(self):
         self.is_enabled = not self.is_enabled
-        self.consecutive_retries = 0
+        self._reset_retries()
         self.state_changed.emit(self.is_enabled)
         logger.info(f"Авто-возобновление переключено: {'ВКЛЮЧЕНО' if self.is_enabled else 'ВЫКЛЮЧЕНО (пауза)'}")
         return self.is_enabled
 
     def force_resume(self):
         self.force_resume_flag = True
-        self.consecutive_retries = 0
+        self._reset_retries()
         logger.info("Ручной вызов возобновления цели.")
 
     def stop(self):
         self._running = False
 
-    def try_usage_limit_resume(self, hwnd, s, max_retries):
+    def _watch_scope(self, inst, s):
+        """
+        Какие чаты учитывать для окна аккаунта: (разрешено, [thread_id] либо None, название открытого чата).
+        - обычный режим: любой чат, решение по самому свежему ходу аккаунта;
+        - watch_visible_chat_only: решение по ходу открытого чата;
+        - watch_selected_chats_only: действуем только в открытом чате, который выбран пользователем
+          (чаты по расписанию, авто-ревью и прочие параллельные чаты не мешают и не возобновляются).
+        Если открытый чат определить не удалось, в режиме «открытого чата» используется ход аккаунта,
+        в режиме «выбранных» ничего не делаем.
+        """
+        selected_mode = bool(s.get("watch_selected_chats_only", False))
+        if not (selected_mode or s.get("watch_visible_chat_only", False)):
+            return True, None, None
+
+        title = get_visible_chat_title(inst.hwnd)
+        tids = []
+        if title:
+            wanted = title.strip().lower()
+            names = {c["id"]: c["title"] for c in read_chat_catalog(inst.home)}
+            for tid, name in get_thread_name_map(inst.home).items():
+                names.setdefault(tid, name)
+            tids = [t for t, n in names.items() if (n or "").strip().lower() == wanted]
+
+        if selected_mode:
+            chosen = {str(x) for x in s.get("selected_chats", [])}
+            tids = [t for t in tids if t in chosen]
+            return bool(tids), (tids or None), title
+        return True, (tids or None), title
+
+    def _latest_turn(self, inst, s, tids=None):
+        """Последний ход для решения о возобновлении: среди tids (если заданы), иначе самый свежий ход аккаунта"""
+        if tids:
+            row = get_latest_turn_info(home=inst.home, thread_ids=tids)
+            if row[0] or s.get("watch_selected_chats_only", False):
+                return row
+        return get_latest_turn_info(home=inst.home)
+
+    def try_usage_limit_resume(self, inst, st, s, max_retries, tag="", tids=None):
         """
         Лимит использования исчерпан: кнопок Resume/Retry нет, поэтому после времени сброса
         отправляем в открытый чат сообщение-продолжение. Возвращает True, если сообщение отправлено.
         """
-        tid, turn_status, err_json, completed_at = get_latest_turn_info()
+        hwnd, home = inst.hwnd, inst.home
+        tid, turn_status, err_json, completed_at = self._latest_turn(inst, s, tids)
         if turn_status != "failed" or not is_usage_limit_error(err_json):
             return False
         if not settings_mgr.is_error_allowed(err_json):
             return False
 
         turn_key = (tid, completed_at)
-        if turn_key == self._usage_sent_key:
+        if turn_key == st.usage_sent_key:
             return False
 
-        thread_cwd = get_thread_project_map().get(str(tid).strip()) if tid else None
+        thread_cwd = get_thread_project_map(home).get(str(tid).strip()) if tid else None
         if thread_cwd and not settings_mgr.is_project_enabled(thread_cwd):
             return False
 
         reset_ts = parse_usage_limit_reset(err_json, completed_at)
-        chat_name = get_thread_name_map().get(str(tid).strip()) if tid else None
-        if turn_key != self._usage_wait_key:
-            self._usage_wait_key = turn_key
-            self._usage_next_try = 0.0
+        chat_name = get_thread_name_map(home).get(str(tid).strip()) if tid else None
+        if turn_key != st.usage_wait_key:
+            st.usage_wait_key = turn_key
+            st.usage_next_try = 0.0
             if reset_ts:
                 logger.info(
                     f"Лимит использования исчерпан | Чат: «{chat_name or 'Активный чат'}». "
-                    f"Продолжение после сброса: {datetime.fromtimestamp(reset_ts):%d.%m %H:%M}."
+                    f"Продолжение после сброса: {datetime.fromtimestamp(reset_ts):%d.%m %H:%M}.{tag}"
                 )
             else:
-                logger.warning("Лимит использования исчерпан, но время сброса в ошибке не найдено. Авто-продолжение пропущено.")
-        if not reset_ts:
-            return False
+                logger.warning(f"Лимит использования исчерпан, время сброса в ошибке не найдено. Будет выполняться проверка снятия лимита.{tag}")
+        st.status = "limit"
 
         now = time.time()
         margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
-        if now < reset_ts + margin or now < self._usage_next_try:
+        if now < st.usage_next_try:
             return False
-        if max_retries > 0 and self.consecutive_retries >= max_retries:
+        if max_retries > 0 and st.consecutive_retries >= max_retries:
             return False
+
+        # По тексту ошибки лимит ещё не сброшен. Пользователь мог сбросить его вручную (reset),
+        # поэтому осторожно проверяем, не стала ли кнопка Send активной: только если он не за компьютером
+        # и поле ввода пустое (чтобы не затереть черновик). Пока лимит активен, Send неактивна и ничего не уходит.
+        probing = reset_ts is None or now < reset_ts + margin
+        if probing:
+            if not s.get("usage_limit_probe_enabled", True):
+                return False
+            if get_user_idle_seconds() < USER_IDLE_BEFORE_CHAT_SWITCH:
+                return False
+            if not composer_is_empty(hwnd):
+                st.usage_next_try = now + 60.0
+                return False
 
         # Сообщение уходит в открытый чат, поэтому он должен совпадать с прерванным
         visible = get_visible_chat_title(hwnd)
         if chat_name and visible and chat_name.strip().lower() != visible.strip().lower():
+            if probing:
+                st.usage_next_try = now + 120.0   # проверку не делаем за счёт смены чата пользователя
+                return False
             # Пользователь не за компьютером -> возвращаемся в прерванный чат сами
             if get_user_idle_seconds() >= USER_IDLE_BEFORE_CHAT_SWITCH and switch_to_sidebar_chat(hwnd, chat_name):
-                logger.info(f"Лимит сброшен, открыт другой чат («{visible}»). Переключение на «{chat_name}».")
-                self._usage_next_try = now + 5.0
+                logger.info(f"Лимит сброшен, открыт другой чат («{visible}»). Переключение на «{chat_name}».{tag}")
+                st.usage_next_try = now + 5.0
                 return False
-            logger.info(f"Лимит сброшен, но открыт другой чат («{visible}» вместо «{chat_name}»). Продолжение отложено.")
-            self._usage_next_try = now + 60.0
+            logger.info(f"Лимит сброшен, но открыт другой чат («{visible}» вместо «{chat_name}»). Продолжение отложено.{tag}")
+            st.usage_next_try = now + 60.0
             return False
 
         message = str(s.get("usage_limit_resume_message", "continue")).strip() or "continue"
         if not send_chat_message(hwnd, message):
-            logger.warning("Лимит сброшен, но отправить сообщение не удалось (кнопка Send неактивна). Повтор через 60 сек.")
-            self._usage_next_try = now + 60.0
+            if probing:
+                st.usage_next_try = now + 120.0   # лимит ещё активен (Send неактивна): тихо повторим позже
+                return False
+            logger.warning(f"Лимит сброшен, но отправить сообщение не удалось (кнопка Send неактивна). Повтор через 60 сек.{tag}")
+            st.usage_next_try = now + 60.0
             return False
 
-        self._usage_sent_key = turn_key
+        if probing:
+            logger.info(f"Лимит снят досрочно (ручной сброс): кнопка Send стала активной.{tag}")
+            st.usage_next_try = now + 300.0
+        st.usage_sent_key = turn_key
         self.resumes_count += 1
-        self.consecutive_retries += 1
+        st.consecutive_retries += 1
         self.stats_updated.emit(self.resumes_count)
         self.resume_triggered.emit("ОТВЕТ")
+        acct = f" | Аккаунт: {account_label(home)}" if tag else ""
         logger.info(
             f">>> ВОЗОБНОВЛЕНИЕ (ЛИМИТ) | Чат: «{chat_name or visible or 'Активный чат'}» | "
-            f"Отправлено сообщение: «{message}»! Всего: {self.resumes_count} <<<"
+            f"Отправлено сообщение: «{message}»{acct}! Всего: {self.resumes_count} <<<"
         )
         return True
+
+    def _process_instance(self, inst, st, s, force, tag=""):
+        """
+        Один проход сторожа по экземпляру Codex (аккаунту). Все ожидания неблокирующие
+        (st.next_check / st.resume_deadline), чтобы один аккаунт не задерживал другой.
+        Возвращает True, если ручное возобновление (force) обработано этим экземпляром.
+        """
+        poll_interval = float(s.get("poll_interval_seconds", 1.0))
+        retry_pause_cfg = float(s.get("retry_pause_seconds", 10.0))
+        cooldown_cfg = float(s.get("post_resume_cooldown", 6.0))
+        max_retries = int(s.get("max_retries_consecutive", 10))
+        hwnd, home = inst.hwnd, inst.home
+
+        def defer(delay):
+            st.next_check = time.time() + delay
+
+        goal_btn, retry_btn, is_running = find_uia_action_buttons(hwnd)
+        st.status = "button" if (goal_btn or retry_btn) else ("generating" if is_running else "watching")
+
+        # Режимы «открытый чат» / «выбранные чаты»: какой чат сейчас под наблюдением
+        allowed, tids, open_title = self._watch_scope(inst, s)
+        if not allowed and open_title:
+            st.status = "skipped"   # открытый чат не отмечен пользователем - не трогаем
+
+        if is_running and not (goal_btn or retry_btn):
+            # Задача генерируется прямо сейчас
+            st.consecutive_retries = 0
+            st.resume_deadline = None
+            return False
+
+        if not (goal_btn or retry_btn):
+            st.resume_deadline = None
+
+        if goal_btn or retry_btn or force:
+            if not allowed and not force:
+                st.resume_deadline = None
+                return False   # чат не выбран; ручное возобновление (force) выполняется всегда
+
+            tid, turn_status, err_json, completed_at = self._latest_turn(inst, s, tids if allowed else None)
+            proj_map = get_thread_project_map(home)
+            thread_cwd = proj_map.get(str(tid).strip()) if tid else None
+
+            # 1. Проверка фильтра проектов
+            if thread_cwd and not settings_mgr.is_project_enabled(thread_cwd):
+                logger.info(f"Проект '{thread_cwd}' исключён в настройках. Авто-возобновление пропущено.{tag}")
+                defer(poll_interval * 2)
+                return force
+
+            # 2. Проверка фильтра ошибок (авто-возобновление ТОЛЬКО при наличии отслеживаемой ошибки)
+            if not force:
+                if not err_json or turn_status in ("interrupted", "completed"):
+                    # Ручная остановка пользователем или нормальное завершение -> НЕ возобновлять
+                    return False
+
+                if not (hasattr(settings_mgr, 'is_error_allowed') and settings_mgr.is_error_allowed(err_json)):
+                    logger.info(f"Ошибка '{err_json[:60]}' отключена в настройках или не отслеживается. Авто-возобновление пропущено.{tag}")
+                    defer(poll_interval * 2)
+                    return False
+
+                # До сброса лимита использования нажимать кнопку бессмысленно. Но пользователь может
+                # сбросить лимит вручную раньше: тогда баннер у поля ввода исчезает -> продолжаем
+                if is_usage_limit_error(err_json):
+                    reset_ts = parse_usage_limit_reset(err_json, completed_at)
+                    margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
+                    if reset_ts and time.time() < reset_ts + margin:
+                        turn_key = (tid, completed_at)
+                        banner = usage_limit_banner_visible(hwnd)
+                        if banner:
+                            st.limit_banner_key = turn_key
+                            st.banner_gone = 0
+                        elif banner is False and st.limit_banner_key == turn_key:
+                            st.banner_gone += 1
+                        if not (banner is False and st.limit_banner_key == turn_key and st.banner_gone >= 3):
+                            defer(poll_interval * 5)
+                            return False
+                        logger.info(f"Лимит снят вручную пользователем (баннер лимита исчез) - возобновление без ожидания сброса.{tag}")
+
+            # 3. Лимит повторов подряд
+            if max_retries > 0 and st.consecutive_retries >= max_retries:
+                logger.warning(f"Достигнут лимит повторов подряд ({max_retries}). Ожидание действий пользователя.{tag}")
+                defer(poll_interval * 3)
+                return force
+
+            is_goal = (goal_btn is not None)
+            mode_name = "ЦЕЛЬ" if is_goal else "ОТВЕТ"
+            btn_chosen = goal_btn if goal_btn else retry_btn
+
+            # Пауза перед нажатием: при первом обнаружении ставим дедлайн, дальше ждём без блокировки
+            now = time.time()
+            if force:
+                pause_left = 0.0
+            elif st.resume_deadline is not None:
+                pause_left = max(0.0, st.resume_deadline - now)
+            elif completed_at and (now - completed_at) < retry_pause_cfg:
+                pause_left = max(0.5, retry_pause_cfg - (now - completed_at))
+            else:
+                pause_left = 1.0
+
+            if pause_left > 0:
+                if st.resume_deadline is None:
+                    btn_name_disp = btn_chosen[1] if btn_chosen else "ручной запуск"
+                    logger.info(f"Обнаружена кнопка '{btn_name_disp}'. Ожидание паузы {pause_left:.1f} сек...{tag}")
+                    st.resume_deadline = now + pause_left
+                return force
+            st.resume_deadline = None
+
+            # Повторная проверка кнопок перед кликом
+            goal_btn, retry_btn, is_running = find_uia_action_buttons(hwnd)
+            if is_running:
+                return force
+
+            target_btn = goal_btn if goal_btn else retry_btn
+            if target_btn:
+                btn_name = target_btn[1]
+                success = invoke_button(target_btn)
+                if success:
+                    self.resumes_count += 1
+                    st.consecutive_retries += 1
+                    self.stats_updated.emit(self.resumes_count)
+                    self.resume_triggered.emit(mode_name)
+
+                    chat_name, goal_obj, is_explicit = get_goal_info_for_thread(tid, home=home)
+                    goal_clean = " ".join(goal_obj.split()) if goal_obj else ""
+                    goal_summary = goal_clean[:120] if goal_clean else ("Цель Codex" if is_goal else "Задача диалога")
+                    item_type = "ЦЕЛЬ" if (is_explicit or is_goal) else "ЗАДАЧА"
+                    acct = f" | Аккаунт: {account_label(home)}" if tag else ""
+
+                    logger.info(
+                        f">>> ВОЗОБНОВЛЕНИЕ ({item_type}) | Чат: «{chat_name}» | {item_type.capitalize()}: «{goal_summary}» "
+                        f"(кнопка: '{btn_name}'){acct}! Всего: {self.resumes_count} <<<"
+                    )
+
+                    # Звуковое оповещение (если включено в настройках)
+                    if s.get("sound_on_resume", False):
+                        try:
+                            ctypes.windll.user32.MessageBeep(0x00000040)
+                        except Exception:
+                            pass
+
+                    defer(cooldown_cfg)
+            return force
+
+        if not is_running:
+            dialog_buttons = list(ALWAYS_DISMISS_DIALOG_BUTTONS)
+            if s.get("auto_trust_folders", False):
+                dialog_buttons.append("Trust folders")
+            if dismiss_blocking_dialog(hwnd, dialog_buttons):
+                defer(poll_interval * 2)
+                return False
+            if allowed and self.try_usage_limit_resume(inst, st, s, max_retries, tag, tids):
+                defer(cooldown_cfg)
+        return False
 
     def run_loop(self):
         attach_desktop()
@@ -841,146 +1258,66 @@ class WatchdogWorker(QObject):
             try:
                 s = settings_mgr.settings
                 poll_interval = float(s.get("poll_interval_seconds", 1.0))
-                retry_pause_cfg = float(s.get("retry_pause_seconds", 10.0))
-                cooldown_cfg = float(s.get("post_resume_cooldown", 6.0))
-                max_retries = int(s.get("max_retries_consecutive", 10))
                 enable_on_codex_start = bool(s.get("enable_on_codex_start", True))
 
-                goals = get_all_recent_goals()
-                self.goals_updated.emit(goals)
+                instances, hidden_instances = scan_codex()
+                pids = {inst.pid for inst in instances}
+                multi = len(instances) > 1
 
-                hwnd = find_codex_window()
-                codex_is_running = (hwnd is not None)
+                for inst in instances:
+                    register_codex_home(inst.home)
+                    if inst.pid not in self._states:
+                        self._states[inst.pid] = _InstanceState()
+                        logger.info(
+                            f"Обнаружен Codex | Аккаунт: {account_label(inst.home)} | PID: {inst.pid} | Данные: {inst.home}"
+                        )
+                for pid in [p for p in self._states if p not in pids]:
+                    self._states.pop(pid, None)
 
-                # Обработка настройки «Включать при старте Кодекса»
-                if enable_on_codex_start:
-                    if self.last_codex_running is False and codex_is_running is True:
-                        if not self.is_enabled:
-                            self.is_enabled = True
-                            self.consecutive_retries = 0
-                            self.state_changed.emit(True)
-                            logger.info("Обнаружен запуск Кодекса -> авто-возобновление автоматически ВКЛЮЧЕНО.")
-                self.last_codex_running = codex_is_running
+                # Цели всех запущенных аккаунтов (если Codex не запущен - аккаунт по умолчанию)
+                homes = []
+                for inst in instances:
+                    if not any(same_home(h, inst.home) for h in homes):
+                        homes.append(inst.home)
+                goals = []
+                for h in (homes or [CODEX_DIR]):
+                    goals.extend(get_all_recent_goals(h))
+                goals.sort(key=lambda g: g[4] or 0, reverse=True)
+                self.goals_updated.emit(goals[:10])
 
-                if not self.is_enabled or not hwnd:
-                    time.sleep(poll_interval)
-                    continue
+                # Обработка настройки «Включать при старте Кодекса»: появился новый экземпляр Codex
+                if enable_on_codex_start and self.last_pids is not None and (pids - self.last_pids):
+                    if not self.is_enabled:
+                        self.is_enabled = True
+                        self._reset_retries()
+                        self.state_changed.emit(True)
+                        logger.info("Обнаружен запуск Кодекса -> авто-возобновление автоматически ВКЛЮЧЕНО.")
+                self.last_pids = pids
 
-                goal_btn, retry_btn, is_running = find_uia_action_buttons(hwnd)
-
-                if is_running and not (goal_btn or retry_btn):
-                    # Задача генерируется прямо сейчас
-                    self.consecutive_retries = 0
-                    time.sleep(poll_interval)
-                    continue
-
-                if goal_btn or retry_btn or self.force_resume_flag:
-                    tid, turn_status, err_json, completed_at = get_latest_turn_info()
-                    proj_map = get_thread_project_map()
-                    thread_cwd = proj_map.get(str(tid).strip()) if tid else None
-
-                    # 1. Проверка фильтра проектов
-                    if thread_cwd and not settings_mgr.is_project_enabled(thread_cwd):
-                        logger.info(f"Проект '{thread_cwd}' исключён в настройках. Авто-возобновление пропущено.")
-                        time.sleep(poll_interval * 2)
-                        continue
-
-                    # 2. Проверка фильтра ошибок (авто-возобновление ТОЛЬКО при наличии отслеживаемой ошибки)
-                    if not self.force_resume_flag:
-                        if not err_json or turn_status in ("interrupted", "completed"):
-                            # Ручная остановка пользователем или нормальное завершение -> НЕ возобновлять
-                            time.sleep(poll_interval)
-                            continue
-
-                        if not (hasattr(settings_mgr, 'is_error_allowed') and settings_mgr.is_error_allowed(err_json)):
-                            logger.info(f"Ошибка '{err_json[:60]}' отключена в настройках или не отслеживается. Авто-возобновление пропущено.")
-                            time.sleep(poll_interval * 2)
-                            continue
-
-                        # До сброса лимита использования нажимать кнопку бессмысленно
-                        if is_usage_limit_error(err_json):
-                            reset_ts = parse_usage_limit_reset(err_json, completed_at)
-                            margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
-                            if reset_ts and time.time() < reset_ts + margin:
-                                time.sleep(poll_interval * 2)
-                                continue
-
-                    # 3. Лимит повторов подряд
-                    if max_retries > 0 and self.consecutive_retries >= max_retries:
-                        logger.warning(f"Достигнут лимит повторов подряд ({max_retries}). Ожидание действий пользователя.")
-                        time.sleep(poll_interval * 3)
-                        continue
-
-                    is_goal = (goal_btn is not None)
-                    mode_name = "ЦЕЛЬ" if is_goal else "ОТВЕТ"
-                    btn_chosen = goal_btn if goal_btn else retry_btn
-
+                if self.is_enabled and instances:
                     now = time.time()
-                    if self.force_resume_flag:
-                        pause_left = 0.0
-                        self.force_resume_flag = False
-                    elif completed_at and (now - completed_at) < retry_pause_cfg:
-                        elapsed = now - completed_at
-                        pause_left = max(0.5, retry_pause_cfg - elapsed)
-                    else:
-                        pause_left = 1.0
-
-                    if pause_left > 0:
-                        btn_name_disp = btn_chosen[1] if btn_chosen else "ручной запуск"
-                        logger.info(f"Обнаружена кнопка '{btn_name_disp}'. Ожидание паузы {pause_left:.1f} сек...")
-                        wait_start = time.time()
-                        while time.time() - wait_start < pause_left and self._running and self.is_enabled:
-                            time.sleep(0.5)
-
-                    if not self.is_enabled or not self._running:
-                        continue
-
-                    # Повторная проверка кнопок перед кликом
-                    goal_btn, retry_btn, is_running = find_uia_action_buttons(hwnd)
-                    if is_running:
-                        time.sleep(poll_interval)
-                        continue
-
-                    target_btn = goal_btn if goal_btn else retry_btn
-                    if target_btn:
-                        btn_name = target_btn[1]
-                        success = invoke_button(target_btn)
-                        if success:
-                            self.resumes_count += 1
-                            self.consecutive_retries += 1
-                            self.stats_updated.emit(self.resumes_count)
-                            self.resume_triggered.emit(mode_name)
-
-                            chat_name, goal_obj, is_explicit = get_goal_info_for_thread(tid)
-                            goal_clean = " ".join(goal_obj.split()) if goal_obj else ""
-                            goal_summary = goal_clean[:120] if goal_clean else ("Цель Codex" if is_goal else "Задача диалога")
-                            item_type = "ЦЕЛЬ" if (is_explicit or is_goal) else "ЗАДАЧА"
-
-                            logger.info(
-                                f">>> ВОЗОБНОВЛЕНИЕ ({item_type}) | Чат: «{chat_name}» | {item_type.capitalize()}: «{goal_summary}» "
-                                f"(кнопка: '{btn_name}')! Всего: {self.resumes_count} <<<"
-                            )
-
-                            # Звуковое оповещение (если включено в настройках)
-                            if s.get("sound_on_resume", False):
-                                try:
-                                    ctypes.windll.user32.MessageBeep(0x00000040)
-                                except Exception:
-                                    pass
-
-                            time.sleep(cooldown_cfg)
+                    force = self.force_resume_flag
+                    force_used = False
+                    for inst in instances:
+                        st = self._states.get(inst.pid)
+                        if st is None or now < st.next_check:
                             continue
+                        tag = f" [{account_label(inst.home)}]" if (multi or not same_home(inst.home, CODEX_DIR)) else ""
+                        try:
+                            if self._process_instance(inst, st, s, force, tag):
+                                force_used = True
+                        except Exception as e:
+                            st.status = "error"
+                            logger.error(f"Исключение при обработке Codex ({account_label(inst.home)}): {e}", exc_info=True)
+                    if force_used:
+                        self.force_resume_flag = False
 
-                elif not is_running:
-                    dialog_buttons = list(ALWAYS_DISMISS_DIALOG_BUTTONS)
-                    if s.get("auto_trust_folders", False):
-                        dialog_buttons.append("Trust folders")
-                    if dismiss_blocking_dialog(hwnd, dialog_buttons):
-                        time.sleep(poll_interval * 2)
-                        continue
-                    if self.try_usage_limit_resume(hwnd, s, max_retries):
-                        time.sleep(cooldown_cfg)
-                        continue
+                # Снимок для трея: какие аккаунты реально под наблюдением и что в них происходит
+                self.monitor_updated.emit({
+                    "instances": [(inst.home, self._states[inst.pid].status) for inst in instances if inst.pid in self._states],
+                    "hidden": [inst.home for inst in hidden_instances],
+                    "ts": time.time(),
+                })
 
                 time.sleep(poll_interval)
             except Exception as e:
@@ -996,6 +1333,10 @@ class CodexTrayManager(QObject):
         self.worker = worker
         self.recent_goals = []
         self.settings_dialog = None
+        self.monitor = {"instances": [], "hidden": [], "ts": 0.0}
+        self._icon_state = None
+        self._tip_core = None
+        self._tip_ts = 0.0
 
         # Скрытый виджет для привязки сообщений меню Win32
         self.dummy = QWidget()
@@ -1008,6 +1349,7 @@ class CodexTrayManager(QObject):
         self.worker.stats_updated.connect(self.on_stats_updated)
         self.worker.resume_triggered.connect(self.on_resume_triggered)
         self.worker.state_changed.connect(self.on_state_changed)
+        self.worker.monitor_updated.connect(self.on_monitor_updated)
 
         # Таймер проверки клика по ярлыку на рабочем столе
         self.trigger_timer = QTimer(self)
@@ -1052,7 +1394,8 @@ class CodexTrayManager(QObject):
         color_map = {
             "active": QColor(16, 185, 129),
             "paused": QColor(100, 116, 139),
-            "working": QColor(14, 165, 233)
+            "working": QColor(14, 165, 233),
+            "warn": QColor(245, 158, 11)
         }
         color = color_map.get(state, QColor(16, 185, 129))
 
@@ -1074,6 +1417,13 @@ class CodexTrayManager(QObject):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(QColor(255, 255, 255)))
             p.drawPolygon(QPolygon([QPoint(44, 41), QPoint(55, 47), QPoint(44, 53)]))
+        elif state == "warn":
+            # Восклицательный знак: сторож включён, но Codex не найден либо не все аккаунты наблюдаются
+            p.setPen(QPen(QColor(255, 255, 255), 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(47, 41, 47, 49)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255)))
+            p.drawEllipse(45, 52, 4, 4)
 
         p.end()
         return QIcon(pix)
@@ -1084,19 +1434,66 @@ class CodexTrayManager(QObject):
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
 
+    def on_monitor_updated(self, snapshot):
+        """Сторож каждую секунду сообщает, какие аккаунты Codex он реально видит и что в них происходит"""
+        self.monitor = snapshot
+        self.update_tray_visuals()
+
     def update_tray_visuals(self, state=None):
-        cur_state = state or ("active" if self.worker.is_enabled else "paused")
-        self.tray.setIcon(self.create_tray_icon(cur_state))
+        enabled = self.worker.is_enabled
+        if state is None:
+            if not enabled:
+                state = "paused"
+            elif time.time() < getattr(self, "_working_until", 0.0):
+                state = "working"
+            elif not self.monitor.get("instances") or self.monitor.get("hidden"):
+                state = "warn"      # ничего не наблюдается либо часть аккаунтов (скрытое окно) вне наблюдения
+            else:
+                state = "active"
+        if state != self._icon_state:
+            self._icon_state = state
+            self.tray.setIcon(self.create_tray_icon(state))
 
         tr = settings_mgr.tr
-        st_str = tr("tip_enabled") if self.worker.is_enabled else tr("tip_disabled")
-        tip = [st_str]
+        lines = [tr("tip_enabled") if enabled else tr("tip_disabled")]
+
+        # Что именно наблюдается: аккаунт -> состояние (наблюдаю / генерация / кнопка / ждёт лимит)
+        status_keys = {
+            "watching": "tip_st_watching", "generating": "tip_st_generating",
+            "button": "tip_st_button", "limit": "tip_st_limit", "error": "tip_st_error",
+            "skipped": "tip_st_skipped",
+        }
+        items = [f"{short_account_name(home)}: {tr(status_keys.get(st, 'tip_st_watching'))}"
+                 for home, st in self.monitor.get("instances", [])]
+        items += [f"{short_account_name(home)}: {tr('tip_st_hidden')}" for home in self.monitor.get("hidden", [])]
+        lines.append(" | ".join(items) if items else tr("tip_no_codex"))
+
+        goals_line = None
         if self.recent_goals:
             active_names = [g[0] for g in self.recent_goals if g[1] in ("active", "blocked") or g[2] == "inProgress"]
             if active_names:
-                tip.append(tr("tip_goals", count=len(active_names), names=", ".join(active_names[:2])))
-        tip.append(tr("tip_resumes", count=self.worker.resumes_count))
-        self.tray.setToolTip("\n".join(tip))
+                goals_line = tr("tip_goals", count=len(active_names), names=", ".join(active_names[:2]))
+
+        ts = self.monitor.get("ts", 0.0)
+        checked = f" · ✓ {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else ""
+        resumes = tr("tip_resumes", count=self.worker.resumes_count)
+
+        def build(tail):
+            # У подсказки трея Windows лимит ~127 символов: при нехватке места отбрасываем строку с целями
+            text = "\n".join(lines + ([goals_line] if goals_line else []) + [tail])
+            if len(text) > 127:
+                text = "\n".join(lines + [tail])
+            return text[:127]
+
+        tip = build(resumes + checked)
+
+        # Не дёргаем подсказку каждую секунду: только при изменении содержимого либо раз в 5 сек (время проверки)
+        core = build(resumes)
+        now = time.time()
+        if core != self._tip_core or now - self._tip_ts >= 5.0:
+            self._tip_core = core
+            self._tip_ts = now
+            self.tray.setToolTip(tip)
 
     def show_initial_notification(self):
         tr = settings_mgr.tr
@@ -1159,7 +1556,9 @@ class CodexTrayManager(QObject):
             win32gui.AppendMenu(hsub, win32con.MF_GRAYED | win32con.MF_DISABLED, 200, tr("menu_no_goals"))
         else:
             for i, g in enumerate(goals):
-                c_name, g_status, turn_st, tid, ts = g
+                c_name, g_status, turn_st, tid, ts, g_home = g
+                if not same_home(g_home, CODEX_DIR):
+                    c_name = f"{c_name} [{account_label(g_home)}]"
                 if turn_st == "inProgress":
                     st_icon = "🟡"
                 elif g_status in ("blocked", "paused") or turn_st == "failed":
@@ -1222,7 +1621,7 @@ class CodexTrayManager(QObject):
             self.on_quit()
         elif cmd >= 201 and cmd < 201 + len(goals):
             chosen_goal = goals[cmd - 201]
-            self.switch_chat(chosen_goal[0])
+            self.switch_chat(chosen_goal[0], chosen_goal[5])
 
     def open_settings_dialog(self):
         """Открытие диалогового окна настроек мгновенно в том же приложении"""
@@ -1317,8 +1716,8 @@ class CodexTrayManager(QObject):
     def on_goals_updated(self, goals):
         self.recent_goals = goals
 
-    def switch_chat(self, chat_name):
-        hwnd = find_codex_window()
+    def switch_chat(self, chat_name, home=None):
+        hwnd = find_codex_window(home)
         if hwnd:
             user32 = ctypes.windll.user32
             if win32gui.IsIconic(hwnd):
@@ -1332,6 +1731,7 @@ class CodexTrayManager(QObject):
 
     def on_resume_triggered(self, mode):
         # Бесшумное визуальное обновление в трее
+        self._working_until = time.time() + 2.5
         self.update_tray_visuals(state="working")
         QTimer.singleShot(2500, lambda: self.update_tray_visuals())
 
