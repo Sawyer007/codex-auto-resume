@@ -412,6 +412,7 @@ def parse_usage_limit_reset(err_json, completed_at=None):
         return None
 
 USER_IDLE_BEFORE_CHAT_SWITCH = 120.0
+RETRY_CAP_COOLDOWN = 600.0   # пауза после лимита повторов подряд, затем попытки продолжаются
 
 def get_user_idle_seconds():
     """Сколько секунд пользователь не трогал клавиатуру и мышь"""
@@ -928,6 +929,7 @@ class _InstanceState:
         self.status = "watching"       # watching / generating / button / limit - для статуса в трее
         self.limit_banner_key = None   # ход, для которого уже виден баннер «лимит исчерпан»
         self.banner_gone = 0           # сколько проходов подряд баннер не виден
+        self.cap_until = None          # до какого времени ждём после лимита повторов подряд
 
 
 class WatchdogWorker(QObject):
@@ -945,6 +947,28 @@ class WatchdogWorker(QObject):
         self.last_pids = None          # PID экземпляров Codex на прошлом проходе (None - ещё не опрашивали)
         self._states = {}              # pid -> _InstanceState
         self._running = True
+
+    def _retry_cap_blocked(self, st, max_retries, tag=""):
+        """
+        Лимит повторов подряд достигнут (сервер перегружен и т.п.). Вместо ожидания пользователя до утра
+        ждём CAP_COOLDOWN секунд и начинаем счёт заново. True - пока ещё ждём.
+        """
+        if max_retries <= 0 or st.consecutive_retries < max_retries:
+            st.cap_until = None
+            return False
+        now = time.time()
+        if st.cap_until is None:
+            st.cap_until = now + RETRY_CAP_COOLDOWN
+            logger.warning(
+                f"Достигнут лимит повторов подряд ({max_retries}). Пауза {RETRY_CAP_COOLDOWN / 60:.0f} мин, затем продолжение.{tag}"
+            )
+            return True
+        if now < st.cap_until:
+            return True
+        st.cap_until = None
+        st.consecutive_retries = 0
+        logger.info(f"Пауза после лимита повторов закончилась - возобновление попыток.{tag}")
+        return False
 
     def _reset_retries(self):
         for st in list(self._states.values()):
@@ -1040,7 +1064,7 @@ class WatchdogWorker(QObject):
         margin = float(s.get("usage_limit_resume_margin_seconds", 60.0))
         if now < st.usage_next_try:
             return False
-        if max_retries > 0 and st.consecutive_retries >= max_retries:
+        if self._retry_cap_blocked(st, max_retries, tag):
             return False
 
         # По тексту ошибки лимит ещё не сброшен. Пользователь мог сбросить его вручную (reset),
@@ -1172,9 +1196,8 @@ class WatchdogWorker(QObject):
                         logger.info(f"Лимит снят вручную пользователем (баннер лимита исчез) - возобновление без ожидания сброса.{tag}")
 
             # 3. Лимит повторов подряд
-            if max_retries > 0 and st.consecutive_retries >= max_retries:
-                logger.warning(f"Достигнут лимит повторов подряд ({max_retries}). Ожидание действий пользователя.{tag}")
-                defer(poll_interval * 3)
+            if self._retry_cap_blocked(st, max_retries, tag):
+                defer(poll_interval * 5)
                 return force
 
             is_goal = (goal_btn is not None)
